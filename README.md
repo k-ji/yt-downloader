@@ -61,7 +61,7 @@ Keep that copy in sync with this repo's `extension/` folder, or remove it in `ch
 
 - Audio download with format selection (MP3, M4A, WAV)
 - Video download (best quality MP4)
-- Transcript download when manual or auto captions are available
+- Clean text transcript download when manual or auto captions are available
 - Members-only content support (via Chrome cookies)
 - Async downloads with status polling
 - Open downloads folder from popup
