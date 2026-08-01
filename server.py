@@ -10,11 +10,15 @@ Usage:
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import uuid
+from html import unescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -113,13 +117,25 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(500, {"ok": False, "error": "ffmpeg not found"})
             return
 
+        transcript = None
+        transcript_work_dir = ""
+        output_template = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+        if mode == "transcript":
+            transcript = _select_transcript(yt_dlp, url)
+            if not transcript:
+                self._respond(404, {"ok": False, "error": "Transcript isn't available"})
+                return
+            transcript_work_dir = tempfile.mkdtemp(prefix="yt-downloader-transcript-")
+            output_template = os.path.join(transcript_work_dir, "%(title)s.%(ext)s")
+
+        task_id = uuid.uuid4().hex[:8]
         cmd = [
             yt_dlp,
             "--no-playlist",
             "--newline",
             "--no-update",
             "--cookies-from-browser", "chrome",
-            "-o", os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+            "-o", output_template,
         ]
 
         if ffmpeg:
@@ -130,10 +146,6 @@ class Handler(BaseHTTPRequestHandler):
         elif mode == "video":
             cmd += ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"]
         else:
-            transcript = _select_transcript(yt_dlp, url)
-            if not transcript:
-                self._respond(404, {"ok": False, "error": "Transcript isn't available"})
-                return
             cmd += [
                 "--skip-download",
                 "--sub-langs", transcript["lang"],
@@ -143,25 +155,45 @@ class Handler(BaseHTTPRequestHandler):
 
         cmd.append(url)
 
-        task_id = uuid.uuid4().hex[:8]
         _tasks[task_id] = {"status": "downloading", "mode": mode, "url": url, "download_dir": DOWNLOAD_DIR}
 
         print(f"[yt-dlp] {task_id} {mode} | {url}")
 
         def _run():
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode == 0:
-                _tasks[task_id] = {
-                    "status": "done",
-                    "mode": mode,
-                    "download_dir": DOWNLOAD_DIR,
-                    "output": _tail(proc.stdout, 1000),
-                }
-                print(f"[yt-dlp] {task_id} done")
-            else:
-                err = _tail(proc.stderr or proc.stdout, 1200) or "unknown error"
+            started_at = time.time()
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode == 0:
+                    result = {
+                        "status": "done",
+                        "mode": mode,
+                        "download_dir": DOWNLOAD_DIR,
+                        "output": _tail(proc.stdout, 1000),
+                    }
+                    if mode == "transcript":
+                        transcript_path = _write_clean_transcript(
+                            proc.stdout,
+                            transcript["lang"],
+                            started_at,
+                            transcript_work_dir or DOWNLOAD_DIR,
+                        )
+                        if not transcript_path:
+                            raise RuntimeError("transcript downloaded but could not be cleaned")
+                        result["transcript_path"] = transcript_path
+                        result["output"] = _tail(f"{proc.stdout}\nClean transcript: {transcript_path}", 1000)
+                    _tasks[task_id] = result
+                    print(f"[yt-dlp] {task_id} done")
+                else:
+                    err = _tail(proc.stderr or proc.stdout, 1200) or "unknown error"
+                    _tasks[task_id] = {"status": "error", "mode": mode, "error": err}
+                    print(f"[yt-dlp] {task_id} error: {err}")
+            except Exception as exc:
+                err = str(exc) or "unknown error"
                 _tasks[task_id] = {"status": "error", "mode": mode, "error": err}
                 print(f"[yt-dlp] {task_id} error: {err}")
+            finally:
+                if transcript_work_dir:
+                    shutil.rmtree(transcript_work_dir, ignore_errors=True)
 
         threading.Thread(target=_run, daemon=True).start()
         self._respond(200, {"ok": True, "task_id": task_id})
@@ -237,6 +269,106 @@ def _choose_language(captions):
             if lang == prefix or lang.startswith(prefix):
                 return lang
     return languages[0]
+
+
+def _write_clean_transcript(output, lang, started_at, search_dir):
+    subtitle_path = _find_subtitle_file(output, lang, started_at, search_dir)
+    if not subtitle_path:
+        return ""
+
+    with open(subtitle_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        subtitle_text = f.read()
+
+    lines = (
+        _clean_srt_transcript(subtitle_text)
+        if subtitle_path.lower().endswith(".srt")
+        else _clean_vtt_transcript(subtitle_text)
+    )
+    if not lines:
+        return ""
+
+    transcript_name = os.path.basename(os.path.splitext(subtitle_path)[0] + ".txt")
+    transcript_path = os.path.join(DOWNLOAD_DIR, transcript_name)
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).strip() + "\n")
+    return transcript_path
+
+
+def _find_subtitle_file(output, lang, started_at, search_dir):
+    candidates = []
+    for match in re.finditer(r"(?:Writing video subtitles to|Destination): (?P<path>.+?\.(?:vtt|srt))", output or ""):
+        path = match.group("path").strip()
+        if os.path.exists(path):
+            candidates.append(path)
+
+    if not candidates:
+        suffixes = (f".{lang}.vtt", f".{lang}.srt", ".vtt", ".srt")
+        for name in os.listdir(search_dir):
+            path = os.path.join(search_dir, name)
+            if not os.path.isfile(path):
+                continue
+            if not name.endswith(suffixes):
+                continue
+            if os.path.getmtime(path) >= started_at - 1:
+                candidates.append(path)
+
+    return max(candidates, key=os.path.getmtime) if candidates else ""
+
+
+def _clean_vtt_transcript(text):
+    lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "WEBVTT" or line.startswith(("Kind:", "Language:", "NOTE", "STYLE", "REGION")):
+            continue
+        if "-->" in line:
+            continue
+        cleaned = _clean_caption_line(line)
+        if cleaned and cleaned not in lines:
+            lines.append(cleaned)
+    return _dedupe_rolling_caption_lines(lines)
+
+
+def _clean_srt_transcript(text):
+    lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.isdigit() or "-->" in line:
+            continue
+        cleaned = _clean_caption_line(line)
+        if cleaned and cleaned not in lines:
+            lines.append(cleaned)
+    return _dedupe_rolling_caption_lines(lines)
+
+
+def _clean_caption_line(line):
+    line = re.sub(r"<\d{2}:\d{2}:\d{2}\.\d{3}>", "", line)
+    line = re.sub(r"</?c(?:\.[^>]*)?>", "", line)
+    line = re.sub(r"<[^>]+>", "", line)
+    line = unescape(line)
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def _dedupe_rolling_caption_lines(lines):
+    cleaned = []
+    for line in lines:
+        if not cleaned:
+            cleaned.append(line)
+            continue
+        previous = cleaned[-1]
+        if line == previous:
+            continue
+        if line.startswith(previous):
+            cleaned[-1] = line
+            continue
+        if previous.startswith(line):
+            continue
+        cleaned.append(line)
+    return cleaned
 
 
 def _tail(text, size):
